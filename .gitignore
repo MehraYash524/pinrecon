@@ -11,6 +11,7 @@ build/
 
 # Runtime data (must never go to GitHub)
 user_data/
+user_data_g/
 history/
 downloads/
 .runtime_guard
@@ -18,6 +19,8 @@ downloads/
 
 # Personal / local folders
 PinRecon_Personal/
+Isolated/
+test.py
 
 # Icons / assets not needed in source
 *.ico
