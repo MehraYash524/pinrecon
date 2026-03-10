@@ -1,11 +1,14 @@
+from pathlib import Path
 import os
 import sys
 import time
+import threading
 import re
 import shutil
 import requests
 from playwright.sync_api import sync_playwright
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 if getattr(sys, "frozen", False):
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(
@@ -27,6 +30,7 @@ GUARD_PATH = os.path.join(BASE_DIR, ".runtime_guard")
 SESSION_LOCK = os.path.join(BASE_DIR, ".session_lock")
 LOGIN_TRUST_PATH = os.path.join(BASE_DIR, ".login_trust.txt")
 login_trust = (os.path.exists(LOGIN_TRUST_PATH))
+LINKS_FILE = os.path.join(HISTORY_DIR, "links.txt")
 warned_unverified = False
 
 
@@ -70,12 +74,92 @@ class Color:
     BRIGHT_CYAN = '\033[96m'
     BRIGHT_WHITE = '\033[97m'
     
+
+    
+# ===== SPINNER =====
+class Spinner:
+    def __init__(self, interval=0.1):
+        self.frames = "◐◓◑◒"
+        self.interval = interval
+        self.running = False
+        self.thread = None
+
+    def _spin(self):
+        i = 0
+        while self.running:
+            frame = self.frames[i % len(self.frames)]
+            sys.stdout.write(f"\r{frame} Extracting ")
+            sys.stdout.flush()
+            time.sleep(self.interval)
+            i += 1
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._spin)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        sys.stdout.write("\r  \r")
+        sys.stdout.flush()
+    
 if os.name == "nt":
     os.system("")
    
 # HELPERS
 TOTAL_STEPS = 4
 _login_step  = 0
+
+
+
+def normalize_link(link: str) -> str:
+    link = link.strip()
+    parsed = urlparse(link)
+
+    scheme = "https"
+    netloc = parsed.netloc.lower()
+
+    # remove trailing slash
+    path = parsed.path.rstrip("/")
+
+    return f"{scheme}://{netloc}{path}"
+
+def load_links() -> set:
+    if not LINKS_FILE.exists():
+        return set()
+
+    with open(LINKS_FILE, "r", encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+    
+def show_existing_links() -> set:
+    links = load_links()
+    
+    print(styled_text("─" * 50, Color.DIM))
+    print("\033[1mExisting links:\033[0m")
+    for l in links:
+        print(l)
+    print(styled_text("─" * 50, Color.DIM))
+
+    return links
+
+def append_link(link: str):
+    with open(LINKS_FILE, "a", encoding="utf-8") as f:
+        f.write(link + "\n")
+
+def check_and_append(url: str, links: set) -> bool:
+    normalized = normalize_link(url)
+
+    if normalized in links:
+        return False
+    else:
+        append_link(normalized)
+        links.add(normalized)   # keep memory consistent
+        return True
+
+
 
 
 def remove_login_trust():
@@ -214,25 +298,37 @@ def resolve_originals(img):
             return u
         for s in ("236x", "474x", "564x", "736x"):
             if f"/{s}/" in u:
-                return u.replace(f"/{s}/", "/originals/")
+                return u.replace(f"/{s}/", "/1200x/")
     return None
 
 # BOARD ID DETECTION
 def detect_board_id(page):
     board_id = None
-    def on_response(resp):
+
+    def handle(route, request):
         nonlocal board_id
-        if board_id or "/resource/" not in resp.url:
-            return
+
+        if "BoardFeedResource/get" not in request.url:
+            return route.continue_()
+
         try:
-            m = re.search(r'"board_id":"(\d+)"', resp.text()) or \
-                re.search(r'"id":"(\d+)","type":"board"', resp.text())
-            if m:
-                board_id = m.group(1)
-        except:
-            pass
-    page.on("response", on_response)
-    return lambda: board_id
+            resp = route.fetch()
+            data = resp.json()
+
+            pins = data.get("resource_response", {}).get("data", [])
+            if pins and not board_id:
+                board_id = pins[0].get("board", {}).get("id")
+
+            route.fulfill(response=resp)
+        except Exception:
+            route.continue_()
+
+    page.route("**/BoardFeedResource/get**", handle)
+
+    def getter():
+        return board_id
+
+    return getter
 
 def styled_text(text, *styles):
     """Apply multiple styles to text"""
@@ -331,9 +427,10 @@ def main():
                     login_trust = False
                     print_success("Login reset.\n")    
                     safe_exit(0, "Restart the program to continue.")
-                    
-                else:
-                    BOARD_URL = ask_board_url()
+
+                elif really == "n":
+                    safe_exit(0)
+
                 
             elif choice == "c":
                 if not login_trust and not warned_unverified:
@@ -345,7 +442,10 @@ def main():
                         "or continue."
                     )
                     warned_unverified = True
+
+                links = show_existing_links()  
                 BOARD_URL = ask_board_url()
+                check_and_append(BOARD_URL, links)
             
             
         else:
@@ -394,9 +494,11 @@ def main():
                 f.write("verified")
                 
             guard_write("LOGIN_VERIFIED")
-            
+
+            links = show_existing_links()  
             BOARD_URL = ask_board_url()
             guard_write("BOARD_SELECTED")
+            check_and_append(BOARD_URL, links)
 
         # EXTRACTION
         print_section("Board Extraction", "🎯")
@@ -419,6 +521,7 @@ def main():
                 print(styled_text("  • Your internet connection", Color.DIM))
                 print(styled_text("  • The board URL is correct", Color.DIM))
                 print(styled_text("  • The board is not deleted", Color.DIM))
+                print(styled_text("  • If nothing works, Clear login data and login again.", Color.DIM))
                 context.close()
                 safe_exit(1)
                 
@@ -472,93 +575,92 @@ def main():
                 print(f"  {styled_text('In History:', Color.BRIGHT_WHITE)}  {styled_text(str(len(history_ids)), Color.BRIGHT_YELLOW)}")
                 print(f"  {styled_text('New Pins:', Color.BRIGHT_WHITE)}    {styled_text(str(delta_new_pins), Color.BRIGHT_GREEN)}")
 
-            if delta_new_pins == 0:
-                context.close()
-                print()
-                print_info("\nNo new pins found.")
-                new_pins = []
-            else:
-                print()
-                print_info(f"Extracting {delta_new_pins} new pins...")
-                
-                seen, new_pins, idle = set(), [], 0
-                board_prefix, last_dom_ids = None, set()
-                last_print = time.time()
 
-                while True:
-                    current_dom_ids = set(
-                        pid for pid in page.eval_on_selector_all(
-                            'div[data-test-id="pin"][data-test-pin-id]',
-                            "els => els.map(e => e.getAttribute('data-test-pin-id'))"
-                        ) if pid
-                    )
+            print()
+            
+            
+            seen, pins, idle = set(), [], 0
+            board_prefix, last_dom_ids = None, set()
+            last_print = time.time()
+            spinner = Spinner()
+            spinner.start()
+            while True:
+                current_dom_ids = set(
+                    pid for pid in page.eval_on_selector_all(
+                        'div[data-test-id="pin"][data-test-pin-id]',
+                        "els => els.map(e => e.getAttribute('data-test-pin-id'))"
+                    ) if pid
+                )
 
-                    snapshot_new = 0
+                snapshot_new = 0
 
-                    for pid in current_dom_ids:  #- for pid in new_dom_ids:  + for pid in current_dom_ids:
-                        if pid in seen:
-                            continue
-                        seen.add(pid)
+                for pid in current_dom_ids:  #- for pid in new_dom_ids:  + for pid in current_dom_ids:
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
 
-                        if board_prefix is None:
-                            board_prefix = pid[:9]
-                        if not pid.startswith(board_prefix):
-                            continue
-                        if pid in history_ids:
-                            continue
+                    if board_prefix is None:
+                        board_prefix = pid[:9]
+                    if not pid.startswith(board_prefix):
+                        continue
+                    
+                    if pid not in history_ids:
 
                         pin_el = page.query_selector(f'div[data-test-pin-id="{pid}"]')
                         if not pin_el:
                             continue
 
                         img = pin_el.query_selector("img")
-                        new_pins.append({
+                        pins.append({
                             "id": pid,
                             "url": f"https://www.pinterest.com/pin/{pid}/",
                             "img_url": resolve_originals(img)
                         })
                         snapshot_new += 1
-                        
-                        # Progress bar (update every 5% or every second)
-                        current_time = time.time()
-                        if len(new_pins) >= delta_new_pins or current_time - last_print >= 1:
-                            print(f"\r  {progress_bar(len(new_pins), delta_new_pins)}", end="", flush=True)
-                            last_print = current_time
-                        
-                        
-                        if len(new_pins) >= delta_new_pins:
-                            break
-
-                    if len(new_pins) >= delta_new_pins:
-                        print(f"\r  {progress_bar(len(new_pins), delta_new_pins)}")
+                        print(f"\r {snapshot_new} new pins...", end="", flush=True)
+                    
+                    # Progress bar (update every 5% or every second)
+                    current_time = time.time()
+                    if len(pins) >= TOTAL_PINS or current_time - last_print >= 1:
+                        print(f"\r  {progress_bar(len(pins), TOTAL_PINS)}", end="", flush=True)
+                        last_print = current_time
+                    
+                    
+                    if len(pins) >= TOTAL_PINS:
                         break
 
-                    idle = 0 if snapshot_new else idle + 1
-                    if idle > 10:
-                        print(f"\r  {progress_bar(len(new_pins), delta_new_pins)}")
+                if len(pins) >= TOTAL_PINS:
+                    print(f"\r  {progress_bar(len(pins), TOTAL_PINS)}")
+                    break
+
+                idle = 0 if snapshot_new else idle + 1
+                if idle > 10:
+                    print(f"\r  {progress_bar(len(pins), TOTAL_PINS)}")
+                    break
+
+                dom_before = set(current_dom_ids)
+                page.evaluate(f"window.scrollBy(0, {SCROLL_STEP})")
+
+                start_wait = time.time()
+                while time.time() - start_wait < MAX_WAIT_AFTER_SCROLL:
+                    dom_after = set(
+                        pid for pid in page.eval_on_selector_all(
+                            'div[data-test-id="pin"][data-test-pin-id]',
+                            "els => els.map(e => e.getAttribute('data-test-pin-id'))"
+                        ) if pid
+                    )
+                    if dom_after - dom_before:
                         break
-
-                    dom_before = set(current_dom_ids)
-                    page.evaluate(f"window.scrollBy(0, {SCROLL_STEP})")
-
-                    start_wait = time.time()
-                    while time.time() - start_wait < MAX_WAIT_AFTER_SCROLL:
-                        dom_after = set(
-                            pid for pid in page.eval_on_selector_all(
-                                'div[data-test-id="pin"][data-test-pin-id]',
-                                "els => els.map(e => e.getAttribute('data-test-pin-id'))"
-                            ) if pid
-                        )
-                        if dom_after - dom_before:
-                            break
-                        time.sleep(POLL_INTERVAL)
-
-                context.close()
+                    time.sleep(POLL_INTERVAL)
+            spinner.stop()  
+            context.close()
 
         # SAVE HISTORY
         with open(HISTORY_PATH, "a", encoding="utf-8") as f:
-            for p in new_pins:
+            new_pins = []
+            for p in pins:
                 pid = p["id"]
+                url = p["url"]
                 img_url = p["img_url"]
                 
                 if not img_url:
@@ -567,6 +669,12 @@ def main():
                 if pid not in history_map:
                     f.write(f"{pid}|{img_url}\n")
                     history_map[pid] = img_url
+                    
+                    new_pins.append({
+                        "id": pid,
+                        "url": url,
+                        "img_url": img_url
+                    })
                     
         extraction_time = time.time() - start
         print()
@@ -729,4 +837,3 @@ def main():
         
 if __name__ == "__main__":
     main()
-    
